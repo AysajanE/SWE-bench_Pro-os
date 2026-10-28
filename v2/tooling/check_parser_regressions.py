@@ -14,9 +14,9 @@ f0341c0b; qutebrowser a25e8a09. The 1ee70fc2 excerpts retain trailing spaces;
 ANSI bytes are preserved. Remaining lines are fixed synthetic cases for spaces,
 nested brackets, shared prefixes, verbose/xdist lines, summary reasons and every
 pair of duplicate statuses in both orders, spanning stdout and stderr, plus
-rerun-then-pass cases. XFAIL/XPASS handling and ANSI stripping in the openlibrary
-and qutebrowser parsers are not exercised because no saved run of these tasks
-prints them.
+rerun-then-pass cases. XFAIL/XPASS handling in every variant, and ANSI
+stripping in the openlibrary and qutebrowser parsers, are not exercised because
+no saved run of these tasks prints them.
 No containers or task test suites are run.
 """
 
