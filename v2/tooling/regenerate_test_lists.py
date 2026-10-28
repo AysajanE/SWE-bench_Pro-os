@@ -16,7 +16,9 @@ Repeat --exclude NODE_ID to omit exact IDs with other known instability, such as
 test_published_in_future_year[1-True], whose now + 365 days stays in the same
 year on January 1 of leap years. Explicit exclusions are reported in
 excluded_tests. Shipped names absent from the regenerated lists are reported in
-dropped_shipped_tests; any such drop exits nonzero without writing stdout.
+dropped_shipped_tests. Excludes matching no measured or shipped name are reported
+in unmatched_excludes. Either report being nonempty, or an empty regenerated
+fail_to_pass, exits 1 without writing stdout; pass_to_pass may be empty.
 Use the original shipped config as --config when regenerating additions.
 
 Usage:
@@ -28,18 +30,21 @@ Usage:
 
 The source config is read only. Stdout contains sorted fail_to_pass/pass_to_pass
 fields, preserving each field's list or encoded-string type and encoding style.
-Stderr contains sorted unstable_tests, date_dependent_tests, excluded_tests and
-dropped_shipped_tests reports. Unstable statuses follow input-run order; null
-means missing. No run execution or config/checksum writes occur.
+Stderr contains sorted unstable_tests, date_dependent_tests, excluded_tests,
+dropped_shipped_tests and unmatched_excludes reports, plus an error message if
+fail_to_pass is empty. Unstable statuses follow input-run order; null means
+missing. No run execution or config/checksum writes occur.
 """
 
 import argparse
 import ast
 import json
 import posixpath
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def load_run(path):
@@ -121,7 +126,8 @@ def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shippe
             lists[field].append(name)
     dropped_shipped = sorted(shipped - set().union(*lists.values()))
     return lists, {"unstable_tests": unstable, "date_dependent_tests": date_dependent,
-                   "excluded_tests": excluded_tests, "dropped_shipped_tests": dropped_shipped}
+                   "excluded_tests": excluded_tests, "dropped_shipped_tests": dropped_shipped,
+                   "unmatched_excludes": sorted(excluded - names - shipped)}
 
 
 def self_test():
@@ -156,7 +162,8 @@ def self_test():
                                              "reference": ["PASSED", "PASSED"],
                                              "empty": ["PASSED", "FAILED"]}],
                          "date_dependent_tests": [current, following],
-                         "excluded_tests": [], "dropped_shipped_tests": []})
+                         "excluded_tests": [], "dropped_shipped_tests": [],
+                         "unmatched_excludes": []})
     lists, report = regenerate([reference], [empty],
                                ["openlibrary/catalog/add_book/tests/test_add_book.py"],
                                run_year=2025)
@@ -180,14 +187,17 @@ def self_test():
                                shipped_names=[test])
     check_equal(lists, {"fail_to_pass": [test], "pass_to_pass": []})
     check_equal(report, {"unstable_tests": [], "date_dependent_tests": [],
-                         "excluded_tests": [], "dropped_shipped_tests": []})
+                         "excluded_tests": [], "dropped_shipped_tests": [],
+                         "unmatched_excludes": []})
     lists, report = regenerate([{test: "PASSED"}], [{test: "FAILED"}],
                                ["openlibrary/catalog/add_book/tests/test_add_book.py"],
-                               shipped_names=[test, absent, unselected], excluded_names=[test])
+                               shipped_names=[test, absent, unselected],
+                               excluded_names=[test, absent, unselected, "test.py::typo"])
     check_equal(lists, {"fail_to_pass": [], "pass_to_pass": []})
     check_equal(report, {"unstable_tests": [], "date_dependent_tests": [],
                          "excluded_tests": [test],
-                         "dropped_shipped_tests": sorted([test, absent, unselected])})
+                         "dropped_shipped_tests": sorted([test, absent, unselected]),
+                         "unmatched_excludes": ["test.py::typo"]})
     for unsupported in ["suite should work", "test.js test name", "TestGo/subtest"]:
         for references, empties, shipped_names in [([{unsupported: "PASSED"}], [{}], []),
                                                    ([{}], [{unsupported: "FAILED"}], []),
@@ -198,6 +208,44 @@ def self_test():
                 check_equal("only pytest node IDs" in str(exc) and unsupported in str(exc), True)
             else:
                 raise RuntimeError("self-test accepted a non-pytest test name")
+
+    # Exercise CLI exit codes, reports and stdout suppression, also under -O.
+    with TemporaryDirectory() as directory:
+        directory = Path(directory)
+        config_path, reference_path, empty_path = [directory / name for name in
+                                                  ("config.json", "reference.json", "empty.json")]
+        keep, unselected = "test.py::keep", "other.py::unselected"
+        reference_path.write_text(json.dumps({"tests": [
+            {"name": name, "status": "PASSED"} for name in (keep, unselected)]}))
+        for template in ([], "[]"):
+            config_path.write_text(json.dumps({"selected_test_files_to_run": ["test.py"],
+                                               "fail_to_pass": template,
+                                               "pass_to_pass": template}))
+            for status, excludes, expected_code in [
+                    ("FAILED", [unselected], 0),
+                    ("FAILED", ["test.py::typo-z", "test.py::typo-a"], 1),
+                    ("PASSED", [], 1),
+                    ("FAILED", [keep], 1)]:
+                empty_path.write_text(json.dumps({"tests": [{"name": keep, "status": status}]}))
+                command = [sys.executable, "-O", str(Path(__file__).resolve()),
+                           "--config", str(config_path), "--reference", str(reference_path),
+                           "--empty", str(empty_path), "--run-year", "2026"]
+                for name in excludes:
+                    command.extend(["--exclude", name])
+                result = subprocess.run(command, capture_output=True, text=True)
+                check_equal(result.returncode, expected_code)
+                report = json.loads(result.stderr)
+                if expected_code == 0:
+                    check_equal(json.loads(result.stdout),
+                                {"fail_to_pass": encode_list([keep], template),
+                                 "pass_to_pass": encode_list([], template)})
+                    check_equal(report["unmatched_excludes"], [])
+                else:
+                    check_equal(result.stdout, "")
+                    if status == "FAILED" and keep not in excludes:
+                        check_equal(report["unmatched_excludes"], sorted(excludes))
+                    else:
+                        check_equal("regenerated fail_to_pass is empty" in report["error"], True)
     print(f"self-test: passed ({checks} checks)")
 
 
@@ -213,7 +261,7 @@ def main():
                         help="calendar year of the measured runs (default: current year)")
     parser.add_argument("--exclude", action="append", default=[], metavar="NODE_ID",
                         help="exclude an exact pytest node ID and report it (repeatable; "
-                             "dropping shipped IDs is an error)")
+                             "unmatched IDs and dropping shipped IDs are errors)")
     parser.add_argument("--self-test", action="store_true", help="run built-in checks and exit")
     args = parser.parse_args()
     if args.self_test:
@@ -231,6 +279,9 @@ def main():
         lists, report = regenerate([load_run(p) for p in args.reference],
                                    [load_run(p) for p in args.empty], selected,
                                    args.run_year, shipped, args.exclude)
+        if not lists["fail_to_pass"]:
+            report["error"] = ("regenerated fail_to_pass is empty; at least one test must fail "
+                               "on empty submissions")
         for field, tests in lists.items():
             lists[field] = encode_list(tests, config[field])
         output = json.dumps(lists, indent=2) + "\n"
@@ -238,7 +289,7 @@ def main():
     except (OSError, ValueError, SyntaxError, KeyError) as exc:
         parser.error(str(exc))
     sys.stderr.write(report_output)
-    if report["dropped_shipped_tests"]:
+    if report["dropped_shipped_tests"] or report["unmatched_excludes"] or "error" in report:
         sys.exit(1)
     sys.stdout.write(output)
 
