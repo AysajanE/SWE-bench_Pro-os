@@ -21,16 +21,32 @@ in unmatched_excludes. Either report being nonempty, or an empty regenerated
 fail_to_pass, exits 1 without writing stdout; pass_to_pass may be empty.
 Use the original shipped config as --config when regenerating additions.
 
+--rename-truncated instead preserves shipped order and list membership. Names
+observed verbatim stay in place. Each other name expands in place to sorted full
+measured IDs whose prefix before the first space equals it, whose file is selected,
+and which pass every reference and either never pass an empty run (fail_to_pass)
+or pass every empty run (pass_to_pass). Consistently opposite-role IDs are ignored.
+One-to-many expansion is allowed; inconsistent run evidence or overlapping ownership
+is ambiguous. Missing mappings and ambiguities exit 1 with a JSON report and no
+stdout. No other IDs are added, removed, moved or date-filtered. --exclude is
+incompatible with this mode. Selections containing node IDs use their file parts
+in this mode only; the source selection field is never changed. Stderr reports
+renamed_tests, unmapped_shipped_tests and ambiguous_shipped_tests.
+
 Usage:
     python3 v2/tooling/regenerate_test_lists.py --config tests/config.json \
         --reference ref-1/output.json ref-2/output.json \
         --empty empty-1/output.json empty-2/output.json --run-year 2026 \
         > test-lists.json 2> excluded-tests.json
+    python3 v2/tooling/regenerate_test_lists.py --rename-truncated \
+        --config shipped-config.json --reference ref-1/output.json ref-2/output.json \
+        --empty empty-1/output.json empty-2/output.json > renamed-lists.json
     python3 v2/tooling/regenerate_test_lists.py --self-test
 
-The source config is read only. Stdout contains sorted fail_to_pass/pass_to_pass
-fields, preserving each field's list or encoded-string type and encoding style.
-Stderr contains sorted unstable_tests, date_dependent_tests, excluded_tests,
+The source config is read only. Stdout contains fail_to_pass/pass_to_pass fields,
+sorted in the default mode, preserving each field's list or encoded-string type
+and encoding style. In the default mode stderr contains sorted unstable_tests,
+date_dependent_tests, excluded_tests,
 dropped_shipped_tests and unmatched_excludes reports, plus an error message if
 fail_to_pass is empty. Unstable statuses follow input-run order; null means
 missing. No run execution or config/checksum writes occur.
@@ -128,6 +144,56 @@ def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shippe
     return lists, {"unstable_tests": unstable, "date_dependent_tests": date_dependent,
                    "excluded_tests": excluded_tests, "dropped_shipped_tests": dropped_shipped,
                    "unmatched_excludes": sorted(excluded - names - shipped)}
+
+
+def rename_truncated(reference_runs, empty_runs, selected_files, shipped_lists):
+    if not reference_runs or len(reference_runs) != len(empty_runs):
+        raise ValueError("supply the same nonzero number of reference and empty runs")
+    selected = {posixpath.normpath(name.split("::", 1)[0]) for name in selected_files}
+    names = set().union(*reference_runs, *empty_runs)
+    shipped = set().union(*shipped_lists.values())
+    unsupported = sorted(name for name in names | shipped if "::" not in name)
+    if unsupported:
+        raise ValueError("only pytest node IDs containing '::' are supported; "
+                         "unsupported test names: " + json.dumps(unsupported))
+    prefixes = {}
+    for name in sorted(names):
+        if posixpath.normpath(name.split("::", 1)[0]) in selected:
+            prefixes.setdefault(name.split(" ", 1)[0], []).append(name)
+    lists = {"fail_to_pass": [], "pass_to_pass": []}
+    report = {"renamed_tests": [], "unmapped_shipped_tests": [],
+              "ambiguous_shipped_tests": []}
+    owners = {}
+    for field in lists:
+        for name in shipped_lists[field]:
+            entry = {"field": field, "name": name}
+            replacements = []
+            if name in names:
+                replacements = [name]
+            else:
+                for full in prefixes.get(name, []):
+                    reference = [run.get(full) for run in reference_runs]
+                    empty = [run.get(full) for run in empty_runs]
+                    if (len({status == "PASSED" for status in reference}) > 1
+                            or len({status == "PASSED" for status in empty}) > 1):
+                        report["ambiguous_shipped_tests"].append(
+                            {**entry, "candidate": full, "reference": reference,
+                             "empty": empty})
+                    elif (all(status == "PASSED" for status in reference)
+                          and all((status == "PASSED") == (field == "pass_to_pass")
+                                  for status in empty)):
+                        replacements.append(full)
+                if not replacements:
+                    report["unmapped_shipped_tests"].append(entry)
+                else:
+                    report["renamed_tests"].append({**entry, "replacements": replacements})
+            for full in replacements:
+                if full in owners:
+                    report["ambiguous_shipped_tests"].append(
+                        {**entry, "candidate": full, "previous_owner": owners[full]})
+                owners[full] = entry
+            lists[field].extend(replacements)
+    return lists, report
 
 
 def self_test():
@@ -246,6 +312,76 @@ def self_test():
                         check_equal(report["unmatched_excludes"], sorted(excludes))
                     else:
                         check_equal("regenerated fail_to_pass is empty" in report["error"], True)
+    # Rename only: preserve shipped positions, roles and verbatim names, even
+    # when a prefix also matches other IDs. Select files from node-ID selections.
+    a, b, exact = "test.py::case[a", "test.py::case[b", "test.py::exact"
+    full = [a + " one]", a + " two]", b + " 2026]", exact + " extra"]
+    reference = dict.fromkeys([exact, *full, "test.py::unshipped"], "PASSED")
+    empty = {full[1]: "ERROR", full[2]: "PASSED", full[3]: "PASSED"}
+    shipped = {"fail_to_pass": [exact, a], "pass_to_pass": [b]}
+    lists, report = rename_truncated([reference, reference], [empty, empty],
+                                     ["./test.py::selected"], shipped)
+    check_equal(lists, {"fail_to_pass": [exact, *full[:2]], "pass_to_pass": [full[2]]})
+    check_equal(report, {"renamed_tests": [
+        {"field": "fail_to_pass", "name": a, "replacements": full[:2]},
+        {"field": "pass_to_pass", "name": b, "replacements": [full[2]]}],
+        "unmapped_shipped_tests": [], "ambiguous_shipped_tests": []})
+    # Opposite-role collisions do not move between lists.
+    lists, report = rename_truncated([reference], [{**empty, full[1]: "PASSED"}],
+                                     ["test.py"], shipped)
+    check_equal(lists["fail_to_pass"], [exact, full[0]])
+    check_equal(report["ambiguous_shipped_tests"], [])
+    for selection, references, empties, source, error in [
+            (["other.py"], [reference], [empty], shipped, "unmapped_shipped_tests"),
+            (["test.py"], [reference], [empty],
+             {"fail_to_pass": ["test.py::missing"], "pass_to_pass": []},
+             "unmapped_shipped_tests"),
+            (["test.py"], [reference], [empty],
+             {"fail_to_pass": [b], "pass_to_pass": []}, "unmapped_shipped_tests"),
+            (["test.py"], [reference, reference], [empty, {**empty, full[0]: "PASSED"}],
+             shipped, "ambiguous_shipped_tests"),
+            (["test.py"], [reference, {**reference, full[0]: "FAILED"}], [empty, empty],
+             shipped, "ambiguous_shipped_tests"),
+            (["test.py"], [reference], [empty],
+             {"fail_to_pass": [a, full[0]], "pass_to_pass": []},
+             "ambiguous_shipped_tests")]:
+        _, report = rename_truncated(references, empties, selection, source)
+        check_equal(bool(report[error]), True)
+    # CLI failures must suppress stdout under -O, and preserve encoded types.
+    with TemporaryDirectory() as directory:
+        directory = Path(directory)
+        config_path, reference_path, empty_path = [directory / name for name in
+                                                  ("config.json", "reference.json", "empty.json")]
+        reference_path.write_text(json.dumps({"tests": [
+            {"name": name, "status": status} for name, status in reference.items()]}))
+        empty_path.write_text(json.dumps({"tests": [
+            {"name": name, "status": status} for name, status in empty.items()]}))
+        for template in ([], "[]", "['old.py::test']"):
+            for case in ("success", "missing", "ambiguous", "exclude"):
+                source = {field: encode_list(tests, template) for field, tests in shipped.items()}
+                if case == "missing":
+                    source["pass_to_pass"] = encode_list(["test.py::missing"], template)
+                elif case == "ambiguous":
+                    source["fail_to_pass"] = encode_list([a, full[0]], template)
+                config_path.write_text(json.dumps({**source,
+                                                   "selected_test_files_to_run": ["test.py::selected"]}))
+                command = [sys.executable, "-O", str(Path(__file__).resolve()),
+                           "--rename-truncated", "--config", str(config_path),
+                           "--reference", str(reference_path), "--empty", str(empty_path)]
+                if case == "exclude":
+                    command.extend(["--exclude", full[0]])
+                result = subprocess.run(command, capture_output=True, text=True)
+                check_equal(result.returncode, 0 if case == "success" else 1)
+                if case == "success":
+                    check_equal(json.loads(result.stdout), {
+                        "fail_to_pass": encode_list([exact, *full[:2]], template),
+                        "pass_to_pass": encode_list([full[2]], template)})
+                else:
+                    check_equal(result.stdout, "")
+                    report = json.loads(result.stderr)
+                    check_equal(bool(report.get({"missing": "unmapped_shipped_tests",
+                                                 "ambiguous": "ambiguous_shipped_tests",
+                                                 "exclude": "error"}[case])), True)
     print(f"self-test: passed ({checks} checks)")
 
 
@@ -263,6 +399,8 @@ def main():
                         help="exclude an exact pytest node ID and report it (repeatable; "
                              "unmatched IDs and dropping shipped IDs are errors)")
     parser.add_argument("--self-test", action="store_true", help="run built-in checks and exit")
+    parser.add_argument("--rename-truncated", action="store_true",
+                        help="replace only truncated shipped IDs in place; preserve order and roles")
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -276,9 +414,17 @@ def main():
         selected = decode_list(config["selected_test_files_to_run"], "selected_test_files_to_run")
         shipped = set().union(*(decode_list(config[field], field)
                                 for field in ("fail_to_pass", "pass_to_pass")))
-        lists, report = regenerate([load_run(p) for p in args.reference],
-                                   [load_run(p) for p in args.empty], selected,
-                                   args.run_year, shipped, args.exclude)
+        if args.rename_truncated:
+            lists, report = rename_truncated(
+                [load_run(p) for p in args.reference], [load_run(p) for p in args.empty],
+                selected, {field: decode_list(config[field], field)
+                           for field in ("fail_to_pass", "pass_to_pass")})
+            if args.exclude:
+                report["error"] = "--exclude cannot be combined with --rename-truncated"
+        else:
+            lists, report = regenerate([load_run(p) for p in args.reference],
+                                       [load_run(p) for p in args.empty], selected,
+                                       args.run_year, shipped, args.exclude)
         if not lists["fail_to_pass"]:
             report["error"] = ("regenerated fail_to_pass is empty; at least one test must fail "
                                "on empty submissions")
@@ -289,7 +435,9 @@ def main():
     except (OSError, ValueError, SyntaxError, KeyError) as exc:
         parser.error(str(exc))
     sys.stderr.write(report_output)
-    if report["dropped_shipped_tests"] or report["unmatched_excludes"] or "error" in report:
+    if (any(report.get(field) for field in ("dropped_shipped_tests", "unmatched_excludes",
+                                          "unmapped_shipped_tests", "ambiguous_shipped_tests"))
+            or "error" in report):
         sys.exit(1)
     sys.stdout.write(output)
 

