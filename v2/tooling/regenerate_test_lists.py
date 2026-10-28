@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Regenerate grading lists from N reference and N empty-submission output.json files.
 
+Only pytest node IDs containing :: are supported. Any shipped or measured name
+without :: is an error, even if it would otherwise be filtered out.
 Only tests whose file exactly matches selected_test_files_to_run are considered
 (after normalizing relative POSIX paths). A test must pass in every reference run.
 fail_to_pass contains those that never pass in an empty run; pass_to_pass contains
-those that pass in every empty run. Status changes within either group, including
-presence/absence changes, are unstable: exclude and report them. A test absent
-from every empty run is consistently not passed and may enter fail_to_pass.
+those that pass in every empty run. Changes between passed and not passed within
+either group are unstable: exclude and report them. FAILED, ERROR and absence
+all count as not passed, so changes among them do not make a test unstable.
 Parametrized IDs containing the run's calendar year or next year in their
 parameters are date-dependent: exclude and report them unless the exact ID is
 already in either shipped grading list. --run-year defaults to the current year.
+Repeat --exclude NODE_ID to omit exact IDs with other known instability, such as
+test_published_in_future_year[1-True], whose now + 365 days stays in the same
+year on January 1 of leap years. Explicit exclusions are reported in
+excluded_tests. Shipped names absent from the regenerated lists are reported in
+dropped_shipped_tests; any such drop exits nonzero without writing stdout.
+Use the original shipped config as --config when regenerating additions.
 
 Usage:
     python3 v2/tooling/regenerate_test_lists.py --config tests/config.json \
@@ -20,9 +28,9 @@ Usage:
 
 The source config is read only. Stdout contains sorted fail_to_pass/pass_to_pass
 fields, preserving each field's list or encoded-string type and encoding style.
-Stderr contains sorted unstable_tests and date_dependent_tests reports. Unstable
-statuses follow input-run order; null means missing. No run execution or
-config/checksum writes occur.
+Stderr contains sorted unstable_tests, date_dependent_tests, excluded_tests and
+dropped_shipped_tests reports. Unstable statuses follow input-run order; null
+means missing. No run execution or config/checksum writes occur.
 """
 
 import argparse
@@ -62,7 +70,18 @@ def decode_list(value, field):
     return value
 
 
-def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shipped_names=()):
+def encode_list(tests, template):
+    if not isinstance(template, str):
+        return tests
+    try:
+        json.loads(template)
+    except ValueError:
+        return repr(tests)
+    return json.dumps(tests)
+
+
+def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shipped_names=(),
+               excluded_names=()):
     if not reference_runs or len(reference_runs) != len(empty_runs):
         raise ValueError("supply the same nonzero number of reference and empty runs")
     if run_year is None:
@@ -71,11 +90,20 @@ def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shippe
     shipped = set(shipped_names)
     selected = {posixpath.normpath(name) for name in selected_files}
     names = set().union(*reference_runs, *empty_runs)
+    unsupported = sorted(name for name in names | shipped if "::" not in name)
+    if unsupported:
+        raise ValueError("only pytest node IDs containing '::' are supported; "
+                         "unsupported test names: " + json.dumps(unsupported))
+    excluded = set(excluded_names)
     lists = {"fail_to_pass": [], "pass_to_pass": []}
     unstable = []
     date_dependent = []
+    excluded_tests = []
     for name in sorted(names):
         if posixpath.normpath(name.split("::", 1)[0]) not in selected:
+            continue
+        if name in excluded:
+            excluded_tests.append(name)
             continue
         reference = [run.get(name) for run in reference_runs]
         empty = [run.get(name) for run in empty_runs]
@@ -85,15 +113,26 @@ def regenerate(reference_runs, empty_runs, selected_files, run_year=None, shippe
                              and name not in shipped)
         if is_date_dependent:
             date_dependent.append(name)
-        if len(set(reference)) > 1 or len(set(empty)) > 1:
+        if (len({status == "PASSED" for status in reference}) > 1
+                or len({status == "PASSED" for status in empty}) > 1):
             unstable.append({"name": name, "reference": reference, "empty": empty})
         elif not is_date_dependent and all(status == "PASSED" for status in reference):
             field = "pass_to_pass" if all(status == "PASSED" for status in empty) else "fail_to_pass"
             lists[field].append(name)
-    return lists, {"unstable_tests": unstable, "date_dependent_tests": date_dependent}
+    dropped_shipped = sorted(shipped - set().union(*lists.values()))
+    return lists, {"unstable_tests": unstable, "date_dependent_tests": date_dependent,
+                   "excluded_tests": excluded_tests, "dropped_shipped_tests": dropped_shipped}
 
 
 def self_test():
+    checks = 0
+
+    def check_equal(actual, expected):
+        nonlocal checks
+        checks += 1
+        if actual != expected:
+            raise RuntimeError(f"self-test check {checks}: {actual!r} != {expected!r}")
+
     prefix = "openlibrary/catalog/add_book/tests/test_add_book.py::TestNormalizeImportRecord::"
     test = prefix + "test_future_publication_dates_are_deleted"
     current = test + "[2026-True]"
@@ -111,20 +150,55 @@ def self_test():
                                [empty, {**empty, unstable: "FAILED"}],
                                ["./openlibrary/catalog/add_book/tests/test_add_book.py"],
                                run_year=2026, shipped_names=[shipped])
-    assert lists == {"fail_to_pass": [absent], "pass_to_pass": sorted([*fixed, shipped, other])}
-    assert report == {"unstable_tests": [{"name": unstable,
-                                          "reference": ["PASSED", "PASSED"],
-                                          "empty": ["PASSED", "FAILED"]}],
-                      "date_dependent_tests": [current, following]}
+    check_equal(lists, {"fail_to_pass": [absent],
+                        "pass_to_pass": sorted([*fixed, shipped, other])})
+    check_equal(report, {"unstable_tests": [{"name": unstable,
+                                             "reference": ["PASSED", "PASSED"],
+                                             "empty": ["PASSED", "FAILED"]}],
+                         "date_dependent_tests": [current, following],
+                         "excluded_tests": [], "dropped_shipped_tests": []})
     lists, report = regenerate([reference], [empty],
                                ["openlibrary/catalog/add_book/tests/test_add_book.py"],
                                run_year=2025)
-    assert current not in lists["pass_to_pass"]
-    assert following in lists["pass_to_pass"]
-    assert report["date_dependent_tests"] == sorted([current, shipped])
-    assert decode_list("['test.py::test']", "fail_to_pass") == ["test.py::test"]
-    assert decode_list('["test.py::test"]', "pass_to_pass") == ["test.py::test"]
-    print("self-test: passed")
+    check_equal(current in lists["pass_to_pass"], False)
+    check_equal(following in lists["pass_to_pass"], True)
+    check_equal(report["date_dependent_tests"], sorted([current, shipped]))
+    check_equal(decode_list("['test.py::test']", "fail_to_pass"), ["test.py::test"])
+    check_equal(decode_list('["test.py::test"]', "pass_to_pass"), ["test.py::test"])
+    for template, expected in [([], ["test.py::test"]),
+                               ("['old.py::test']", "['test.py::test']"),
+                               ('["old.py::test"]', '["test.py::test"]')]:
+        check_equal(encode_list(["test.py::test"], template), expected)
+        quoted = ["test.py::test[quote's]", 'test.py::test["quoted"]']
+        check_equal(decode_list(encode_list(quoted, template), "tests"), quoted)
+
+    # Different non-pass statuses and missing entries are equally stable.
+    reference = {test: "PASSED", other: "FAILED"}
+    lists, report = regenerate([reference, {**reference, other: "ERROR"}, {test: "PASSED"}],
+                               [{test: "FAILED"}, {test: "ERROR"}, {}],
+                               ["openlibrary/catalog/add_book/tests/test_add_book.py"],
+                               shipped_names=[test])
+    check_equal(lists, {"fail_to_pass": [test], "pass_to_pass": []})
+    check_equal(report, {"unstable_tests": [], "date_dependent_tests": [],
+                         "excluded_tests": [], "dropped_shipped_tests": []})
+    lists, report = regenerate([{test: "PASSED"}], [{test: "FAILED"}],
+                               ["openlibrary/catalog/add_book/tests/test_add_book.py"],
+                               shipped_names=[test, absent, unselected], excluded_names=[test])
+    check_equal(lists, {"fail_to_pass": [], "pass_to_pass": []})
+    check_equal(report, {"unstable_tests": [], "date_dependent_tests": [],
+                         "excluded_tests": [test],
+                         "dropped_shipped_tests": sorted([test, absent, unselected])})
+    for unsupported in ["suite should work", "test.js test name", "TestGo/subtest"]:
+        for references, empties, shipped_names in [([{unsupported: "PASSED"}], [{}], []),
+                                                   ([{}], [{unsupported: "FAILED"}], []),
+                                                   ([{}], [{}], [unsupported])]:
+            try:
+                regenerate(references, empties, ["test.py"], shipped_names=shipped_names)
+            except ValueError as exc:
+                check_equal("only pytest node IDs" in str(exc) and unsupported in str(exc), True)
+            else:
+                raise RuntimeError("self-test accepted a non-pytest test name")
+    print(f"self-test: passed ({checks} checks)")
 
 
 def main():
@@ -137,6 +211,9 @@ def main():
                         help="empty-submission output.json files, in run order")
     parser.add_argument("--run-year", type=int, default=date.today().year,
                         help="calendar year of the measured runs (default: current year)")
+    parser.add_argument("--exclude", action="append", default=[], metavar="NODE_ID",
+                        help="exclude an exact pytest node ID and report it (repeatable; "
+                             "dropping shipped IDs is an error)")
     parser.add_argument("--self-test", action="store_true", help="run built-in checks and exit")
     args = parser.parse_args()
     if args.self_test:
@@ -153,21 +230,17 @@ def main():
                                 for field in ("fail_to_pass", "pass_to_pass")))
         lists, report = regenerate([load_run(p) for p in args.reference],
                                    [load_run(p) for p in args.empty], selected,
-                                   args.run_year, shipped)
+                                   args.run_year, shipped, args.exclude)
         for field, tests in lists.items():
-            if isinstance(config.get(field), str):
-                try:
-                    json.loads(config[field])
-                except ValueError:
-                    lists[field] = repr(tests)
-                else:
-                    lists[field] = json.dumps(tests)
+            lists[field] = encode_list(tests, config[field])
         output = json.dumps(lists, indent=2) + "\n"
         report_output = json.dumps(report, indent=2) + "\n"
     except (OSError, ValueError, SyntaxError, KeyError) as exc:
         parser.error(str(exc))
-    sys.stdout.write(output)
     sys.stderr.write(report_output)
+    if report["dropped_shipped_tests"]:
+        sys.exit(1)
+    sys.stdout.write(output)
 
 
 if __name__ == "__main__":

